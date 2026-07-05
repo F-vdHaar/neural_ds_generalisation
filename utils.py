@@ -25,6 +25,9 @@ from scipy.signal import cheby1, sosfiltfilt
 from scipy.interpolate import interp1d
 from scipy.stats import pearsonr
 
+from scipy.ndimage import percentile_filter
+
+
 
 def standardize_trace(dff, t, target_fs=30.0, aa_safety_factor=0.9):
     """
@@ -341,3 +344,103 @@ def bounded_cross_correlation_alignment(dff_trace, binned_spikes, frame_rate, ma
         aligned_spikes = binned_spikes
 
     return aligned_dff, aligned_spikes, best_lag
+
+
+
+def compute_dynamic_dff(f_soma, f_neuropil=None, alpha=0.7, fps=30.0, window_sec=15.0, percentile=8):
+    """
+    Performs neuropil subtraction and computes a dynamic dF/F trace using a sliding percentile filter.
+    Strictly avoids clipping negative values to preserve shot-noise distributions.
+    
+    Parameters:
+    -----------
+    f_soma : 1D numpy array
+        Raw fluorescence trace from the somatic ROI.
+    f_neuropil : 1D numpy array or None
+        Raw fluorescence trace from the surrounding neuropil ROI.
+    alpha : float
+        Neuropil contamination coefficient (default 0.7).
+    fps : float
+        Sampling rate in Hz.
+    window_sec : float
+        Sliding window size in seconds for baseline estimation.
+    percentile : int
+        Percentile to use for the baseline calculation (default 8th percentile).
+        
+    Returns:
+    --------
+    dff : 1D numpy array
+        The normalized dF/F trace.
+    f0 : 1D numpy array
+        The computed dynamic baseline.
+    """
+    # 1. Neuropil Subtraction
+    if f_neuropil is not None:
+        f_corrected = f_soma - (alpha * f_neuropil)
+    else:
+        # If dataset only provides pre-subtracted traces
+        f_corrected = np.copy(f_soma)
+        
+    # 2. Dynamic Baseline Estimation
+    window_frames = int(window_sec * fps)
+    
+    # Ensure window is odd for symmetric filtering padding
+    if window_frames % 2 == 0:
+        window_frames += 1 
+        
+    f0 = percentile_filter(f_corrected, percentile=percentile, size=window_frames, mode='reflect')
+    
+    # 3. Compute dF/F
+    # We use absolute value of F0 in the denominator to prevent gradient inversions 
+    # if extreme neuropil subtraction temporarily pushes the baseline below zero.
+    # Epsilon prevents ZeroDivisionError on perfectly flat artifact regions.
+    epsilon = np.finfo(float).eps
+    dff = (f_corrected - f0) / (np.abs(f0) + epsilon)
+    
+    return dff, f0
+
+def robust_quality_control(dff, spikes, min_spikes=5, snr_threshold=2.5):
+    """
+    Evaluates if a trace meets the required quality thresholds for gradient descent.
+    
+    Parameters:
+    -----------
+    dff : 1D numpy array
+        The normalized dF/F trace.
+    spikes : 1D numpy array
+        Discrete vector of binned ground truth spikes.
+    min_spikes : int
+        Minimum number of action potentials required in the recording.
+    snr_threshold : float
+        Minimum Signal-to-Noise Ratio.
+        
+    Returns:
+    --------
+    is_valid : bool
+        True if the recording passes Quality Control.
+    metrics : dict
+        Dictionary containing calculated SNR and total spikes.
+    """
+    total_spikes = np.sum(spikes)
+    
+    # Estimate baseline noise (nu) using Median Absolute Deviation (MAD)
+    # MAD is robust to the large positive skew caused by actual calcium transients
+    median_dff = np.median(dff)
+    mad = np.median(np.abs(dff - median_dff))
+    
+    # Convert MAD to standard deviation equivalent for normal distribution
+    noise_est = mad * 1.4826
+    
+    # Signal variance vs Noise variance approximation
+    signal_est = np.std(dff)
+    snr = signal_est / (noise_est + np.finfo(float).eps)
+    
+    is_valid = bool((total_spikes >= min_spikes) and (snr >= snr_threshold))
+    
+    metrics = {
+        "total_spikes": total_spikes,
+        "snr": snr,
+        "noise_level": noise_est
+    }
+    
+    return is_valid, metrics
