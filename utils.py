@@ -399,7 +399,10 @@ def compute_dynamic_dff(f_soma, f_neuropil=None, alpha=0.7, fps=30.0, window_sec
     
     return dff, f0
 
-def robust_quality_control(dff, spikes, min_spikes=5, snr_threshold=2.5):
+
+
+
+def robust_quality_control(dff, spikes, fps, min_spikes=5, snr_threshold=2.5):
     """
     Evaluates if a trace meets the required quality thresholds for gradient descent.
     
@@ -409,6 +412,8 @@ def robust_quality_control(dff, spikes, min_spikes=5, snr_threshold=2.5):
         The normalized dF/F trace.
     spikes : 1D numpy array
         Discrete vector of binned ground truth spikes.
+    fps : float
+        The sampling rate of the recording in Hz (required for Cascade noise metric).
     min_spikes : int
         Minimum number of action potentials required in the recording.
     snr_threshold : float
@@ -422,17 +427,30 @@ def robust_quality_control(dff, spikes, min_spikes=5, snr_threshold=2.5):
         Dictionary containing calculated SNR and total spikes.
     """
     total_spikes = np.sum(spikes)
+
     
+    # FIX CASCADE uses MASD
     # Estimate baseline noise (nu) using Median Absolute Deviation (MAD)
     # MAD is robust to the large positive skew caused by actual calcium transients
-    median_dff = np.median(dff)
-    mad = np.median(np.abs(dff - median_dff))
+   # median_dff = np.median(dff)
+    # mad = np.median(np.abs(dff - median_dff))
     
     # Convert MAD to standard deviation equivalent for normal distribution
-    noise_est = mad * 1.4826
+    # noise_est = mad * 1.4826
+
+
+
+    # Cascade's standardized noise metric (Rupprecht et al., 2021)
+    # Frame-to-frame dF/F fluctuation normalized by frame rate
+    successive_diffs = np.diff(dff)
     
+    # Calculate MASD and normalize by sqrt(fps) to match Cascade standard
+    noise_est = np.median(np.abs(successive_diffs)) / np.sqrt(fps)
+
     # Signal variance vs Noise variance approximation
     signal_est = np.std(dff)
+    
+    # Epsilon prevents ZeroDivisionError if a trace is perfectly flat (artifact)
     snr = signal_est / (noise_est + np.finfo(float).eps)
     
     is_valid = bool((total_spikes >= min_spikes) and (snr >= snr_threshold))
