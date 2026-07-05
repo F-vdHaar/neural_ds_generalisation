@@ -26,7 +26,7 @@ from scipy.interpolate import interp1d
 from scipy.stats import pearsonr
 
 from scipy.ndimage import percentile_filter
-
+from scipy.ndimage import gaussian_filter1d
 
 
 def standardize_trace(dff, t, target_fs=30.0, aa_safety_factor=0.9):
@@ -461,4 +461,43 @@ def robust_quality_control(dff, spikes, fps, min_spikes=5, snr_threshold=2.5):
         "noise_level": noise_est
     }
     
-    return is_valid, metrics
+    return is_valid, 
+
+
+
+def smooth_spike_train(spike_counts: np.ndarray, target_fs: float = 30.0, sigma_sec: float = 0.05) -> np.ndarray:
+    """
+    Convolves a discrete spike count array with a Gaussian kernel to create
+    a continuous spike rate target for 1D-CNN training.
+
+    Parameters:
+    -----------
+    spike_counts : np.ndarray
+        1D array of discrete binned spike counts (e.g., 0, 1, 2) at the target frame rate.
+    target_fs : float
+        The sampling frequency of the array in Hz. Default is 30.0 Hz.
+    sigma_sec : float
+        The standard deviation of the Gaussian kernel in seconds. 
+        Default is 0.05s, calibrated for 30Hz recordings.
+
+    Returns:
+    --------
+    smoothed_rates : np.ndarray
+        1D array of continuous smoothed spike rates, preserving the original shape.
+    """
+    # 1. Convert physical time (seconds) to discrete frames based on sampling rate
+    sigma_frames = sigma_sec * target_fs
+    
+    # 2. Apply zero-phase 1D Gaussian convolution
+    # mode='constant' with cval=0.0 ensures we assume zero biological activity 
+    # outside the recording boundaries, avoiding artificial edge padding artifacts.
+    smoothed_rates = gaussian_filter1d(
+        input=spike_counts.astype(float),
+        sigma=sigma_frames,
+        mode='constant',
+        cval=0.0 
+    )
+    
+    return smoothed_rates
+
+
