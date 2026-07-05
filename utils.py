@@ -28,6 +28,8 @@ from scipy.stats import pearsonr
 from scipy.ndimage import percentile_filter
 from scipy.ndimage import gaussian_filter1d
 
+from typing import Dict, Tuple, List
+
 
 def standardize_trace(dff, t, target_fs=30.0, aa_safety_factor=0.9):
     """
@@ -501,3 +503,85 @@ def smooth_spike_train(spike_counts: np.ndarray, target_fs: float = 30.0, sigma_
     return smoothed_rates
 
 
+
+def partition_recordings(
+    dataset: Dict[str, dict], 
+    val_ratio: float = 0.15, 
+    seed: int = 42
+) -> Tuple[Dict[str, dict], Dict[str, dict]]:
+    """
+    Partitions calcium imaging data strictly at the recording/dataset level.
+    Must be executed BEFORE any sliding window operations to prevent temporal leakage.
+    
+    Parameters:
+    -----------
+    dataset : dict
+        The master dictionary containing processed recordings (e.g., phase2_aligned_data).
+    val_ratio : float
+        Proportion of recordings to allocate to the validation set.
+    seed : int
+        Random state for reproducibility.
+        
+    Returns:
+    --------
+    train_set, val_set : Tuple of disjoint dictionaries.
+    """
+    np.random.seed(seed)
+    
+    # Isolate recording IDs to perform macro-level splits
+    recording_ids = list(dataset.keys())
+    np.random.shuffle(recording_ids)
+    
+    n_total = len(recording_ids)
+    n_val = int(n_total * val_ratio)
+    
+    # Establish mutually exclusive sets
+    val_ids = recording_ids[:n_val]
+    train_ids = recording_ids[n_val:]
+    
+    # Reconstruct isolated datasets
+    train_set = {rid: dataset[rid] for rid in train_ids}
+    val_set = {rid: dataset[rid] for rid in val_ids}
+    
+    return train_set, val_set
+
+def generate_sliding_windows(
+    isolated_dataset: Dict[str, dict], 
+    window_size: int = 64
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Maps continuous recordings to a Hankel matrix via a sliding window.
+    Applies ONLY to a pre-isolated subset to guarantee out-of-distribution evaluation.
+    
+    Parameters:
+    -----------
+    isolated_dataset : dict
+        A disjoint subset (e.g., train_set) returned by partition_recordings.
+    window_size : int
+        The temporal receptive field of the 1D-CNN (default: 64 frames).
+        
+    Returns:
+    --------
+    X : np.ndarray
+        Shape (N_samples, window_size). The input delta F/F windows.
+    Y : np.ndarray
+        Shape (N_samples,). The center-aligned ground truth smoothed spike rate.
+    """
+    X, Y = [], []
+    half_window = window_size // 2
+    
+    for rec_id, data in isolated_dataset.items():
+        # Grabbing the exact variable names generated in your Phase 2 and Phase 4 loops
+        dff = data['aligned_dff']
+        spikes = data['smoothed_spike_rates']
+        
+        # Skip recordings smaller than the receptive field
+        if len(dff) <= window_size:
+            continue
+            
+        # Stride = 1 step
+        for t in range(half_window, len(dff) - half_window):
+            X.append(dff[t - half_window : t + half_window])
+            Y.append(spikes[t]) 
+            
+    return np.array(X, dtype=np.float32), np.array(Y, dtype=np.float32)
