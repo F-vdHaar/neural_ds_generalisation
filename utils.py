@@ -885,6 +885,7 @@ def generate_sliding_windows(
     window_size: int = 64,
     dff_key: str = "dff_clean",
     target_key: str = "smoothed_spike_rates",
+    stride: int = 1,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Maps continuous recordings to a Hankel matrix via a sliding window.
@@ -949,4 +950,89 @@ def generate_sliding_windows(
             X.append(dff[t - half_window : t + half_window])
             Y.append(spikes[t])
 
-    return np.array(X, dtype=np.float32), np.array(Y, dtype=np.float32)
+    return np.array(X, dtype=np.float32), np.array(Y, dtype=np.float32
+
+
+def scale_features(X_train, X_val, X_test):
+    """
+    Standardizes features by removing the mean and scaling to unit variance.
+    Crucially, it computes the metrics ONLY on the training set to prevent 
+    data leakage into the test set.
+    """
+    print("--- Feature Scaling (Z-Scoring) ---")
+    
+    # 1. Calculate GLOBAL mean and std from the TRAINING set only.
+    # We take the global scalar mean, NOT axis=0. If you use axis=0, you  
+    # normalize each time-bin independently, which completely destroys the 
+    # temporal shape of your calcium transients!
+    mu_train = np.mean(X_train)
+    sigma_train = np.std(X_train)
+    
+    # Guard against division by zero (rare, but good defensive programming)
+    if sigma_train == 0:
+        sigma_train = 1e-8
+        
+    print(f"Training Mean: {mu_train:.4f} | Training Std: {sigma_train:.4f}")
+
+    # 2. Apply the exact same transformation to all datasets
+    X_train_scaled = (X_train - mu_train) / sigma_train
+    X_val_scaled = (X_val - mu_train) / sigma_train
+    X_test_scaled = (X_test - mu_train) / sigma_train
+
+    return X_train_scaled, X_val_scaled, X_test_scaled
+
+
+
+
+    ####### EVALUATION _ TODO
+
+    def evaluate_predictions(y_true: np.ndarray, y_pred: np.ndarray, threshold: float = 0.1) -> dict:
+    """
+    Formally evaluates 1D-CNN predictions against ground-truth spike rates.
+    
+    PROBLEM
+        Loss functions like MSE are necessary for backpropagation but are 
+        biologically uninterpretable. An MSE of 0.04 doesn't tell us if the 
+        model actually detected the spikes.
+        
+    SOLUTION
+        Calculate Pearson Correlation (r) to measure kinetic shape alignment, 
+        and F1-Score to measure exact discrete event detection.
+        
+    Parameters
+    ----------
+    y_true : np.ndarray
+        1D array of ground-truth smoothed spike rates.
+    y_pred : np.ndarray
+        1D array of network predictions.
+    threshold : float
+        The cutoff value to binarize continuous predictions into discrete spikes.
+        
+    Returns
+    -------
+    metrics : dict
+        Contains 'pearson_r', 'f1_score', and 'mse'.
+    """
+    from scipy.stats import pearsonr
+    from sklearn.metrics import f1_score
+    
+    # 1. Pearson Correlation (Kinetic Shape & Timing)
+    # Returns (statistic, p-value), we only need the statistic
+    r_val, _ = pearsonr(y_true, y_pred)
+    
+    # 2. Mean Squared Error (Magnitude accuracy)
+    mse = np.mean((y_true - y_pred)**2)
+    
+    # 3. F1-Score (Discrete Detection)
+    # Binarize the ground truth: if the smoothed rate is > 0, a spike occurred nearby
+    y_true_binary = (y_true > 0).astype(int)
+    # Binarize the prediction: if the network outputs a rate > threshold, call it a spike
+    y_pred_binary = (y_pred > threshold).astype(int)
+    
+    # F1 is the harmonic mean of precision and recall. 
+    # zero_division=0 prevents warnings if the network predicts absolutely nothing.
+    f1 = f1_score(y_true_binary, y_pred_binary, zero_division=0)
+    
+    return {
+        "pearson_r": r_val,
+     
