@@ -880,6 +880,63 @@ def partition_recordings(
 
     return train_set, val_set
 
+
+def augment_train_noise(train_recordings: Dict[str, dict], target_fs: float = 30.0) -> Dict[str, dict]:
+    """
+    Data Augmentation: Injects Gaussian noise into clean training recordings so that 
+    the entire training set shares a uniform, worst-case noise distribution.
+    
+    PROBLEM
+        CNNs learn high-frequency textures. If trained on clean data, they will 
+        generate massive False Positives when exposed to noisy test datasets.
+        
+    SOLUTION
+        Find the maximum baseline noise (MASD) in the training set. For every 
+        cleaner recording, calculate the missing variance and inject Gaussian 
+        noise (N(0, sigma_add)) to perfectly match the target noise floor.
+    """
+    import copy
+    
+    # 1. Calculate the exact noise level (MASD) of every training recording
+    noise_levels = {}
+    for rid, data in train_recordings.items():
+        # MASD formula (identical to your robust_quality_control)
+        diffs = np.diff(data['dff_clean'])
+        masd = np.median(np.abs(diffs))
+        # Convert MASD to an approximate standard deviation
+        sigma_approx = (masd / 0.6745)
+        noise_levels[rid] = sigma_approx
+
+    # 2. Find the "worst" (highest) noise level to act as our target
+    target_noise = np.max(list(noise_levels.values()))
+    
+    augmented_dataset = {}
+    
+    # 3. Inject missing noise
+    for rid, data in train_recordings.items():
+        # Always keep the original clean trace (doubles our dataset size!)
+        augmented_dataset[rid] = copy.deepcopy(data)
+        
+        current_noise = noise_levels[rid]
+        
+        # Calculate how much noise variance is "missing"
+        # Variance adds linearly: sigma_target^2 = sigma_current^2 + sigma_added^2
+        missing_variance = (target_noise ** 2) - (current_noise ** 2)
+        
+        if missing_variance > 0:
+            sigma_added = np.sqrt(missing_variance)
+            
+            # Generate the artificial noise
+            noise_vector = np.random.normal(scale=sigma_added, size=len(data['dff_clean']))
+            
+            # Create a noisy clone
+            noisy_rid = f"{rid}_augmented"
+            augmented_dataset[noisy_rid] = copy.deepcopy(data)
+            
+            # Inject the noise into the dF/F trace
+            augmented_dataset[noisy_rid]['dff_clean'] += noise_vector
+            
+    return augmented_dataset
 def generate_sliding_windows(
     isolated_dataset: Dict[str, dict],
     window_size: int = 64,
@@ -914,6 +971,9 @@ def generate_sliding_windows(
         Per-recording dict key holding the input dF/F trace to window.
     target_key : str
         Per-recording dict key holding the smoothed spike-rate target.
+    stride : int
+        The number of frames to skip between successive windows to reduce 
+        temporal autocorrelation (default: 1).
 
     Returns:
     --------
@@ -945,15 +1005,16 @@ def generate_sliding_windows(
         if len(dff) <= window_size:
             continue
 
-        # Stride = 1 step
-        for t in range(half_window, len(dff) - half_window):
+        # Apply the dynamic stride to reduce temporal autocorrelation
+        for t in range(half_window, len(dff) - half_window, stride):
             X.append(dff[t - half_window : t + half_window])
             Y.append(spikes[t])
 
-    return np.array(X, dtype=np.float32), np.array(Y, dtype=np.float32
+    return np.array(X, dtype=np.float32), np.array(Y, dtype=np.float32)
 
 
-def scale_features(X_train, X_val, X_test):
+
+def scale_features(X_train, X_val):
     """
     Standardizes features by removing the mean and scaling to unit variance.
     Crucially, it computes the metrics ONLY on the training set to prevent 
@@ -977,16 +1038,16 @@ def scale_features(X_train, X_val, X_test):
     # 2. Apply the exact same transformation to all datasets
     X_train_scaled = (X_train - mu_train) / sigma_train
     X_val_scaled = (X_val - mu_train) / sigma_train
-    X_test_scaled = (X_test - mu_train) / sigma_train
 
-    return X_train_scaled, X_val_scaled, X_test_scaled
+
+    return X_train_scaled, X_val_scaled
 
 
 
 
     ####### EVALUATION _ TODO
 
-    def evaluate_predictions(y_true: np.ndarray, y_pred: np.ndarray, threshold: float = 0.1) -> dict:
+def evaluate_predictions(y_true: np.ndarray, y_pred: np.ndarray, threshold: float = 0.1) -> dict:
     """
     Formally evaluates 1D-CNN predictions against ground-truth spike rates.
     
@@ -1035,4 +1096,5 @@ def scale_features(X_train, X_val, X_test):
     
     return {
         "pearson_r": r_val,
+    }
      
