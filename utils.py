@@ -409,7 +409,7 @@ def fit_dataset_level_lag(dff_traces, binned_spikes_list, frame_rate, max_lag_se
     return best_lag
 
 
-# Not used in assumed hardware lag cleaned data
+# Not used in assumed hardware lag aligned data
 # also will destroy the current 
 def apply_lag(dff_trace, binned_spikes, lag):
     """
@@ -615,6 +615,9 @@ def compute_dynamic_dff(f_soma, f_neuropil=None, alpha=0.7, fps=30.0, window_sec
     return dff, f0
 
 
+import numpy as np
+from scipy.ndimage import percentile_filter, uniform_filter1d
+
 def correct_dff_baseline_drift(dff, fps=30.0, window_sec=15.0, percentile=8):
     """
     Removes slow baseline drift (e.g. residual photobleaching) from an
@@ -632,9 +635,9 @@ def correct_dff_baseline_drift(dff, fps=30.0, window_sec=15.0, percentile=8):
 
     SOLUTION
         Estimate the slow drift as a rolling low percentile of the dF/F
-        trace itself, then SUBTRACT it (an additive correction). No
-        division by baseline is needed, because the input is already a
-        normalized ratio -- there's nothing left to normalize by.
+        trace itself. To avoid non-linear edge artifacts (jagged steps) 
+        underneath dense spike bursts, smooth this percentile estimate with 
+        a uniform filter. Finally, SUBTRACT it (an additive correction).
 
     WHY NOT
         Re-deriving "dF/F of dF/F" via compute_dynamic_dff: mathematically
@@ -658,20 +661,27 @@ def correct_dff_baseline_drift(dff, fps=30.0, window_sec=15.0, percentile=8):
         The drift-corrected dF/F trace (dff - drift). Negative values are
         preserved, not clipped, consistent with the rest of this pipeline.
     drift : np.ndarray
-        The estimated slow-drift component that was subtracted.
+        The estimated (and smoothed) slow-drift component that was subtracted.
     """
     dff = np.asarray(dff, dtype=float)
 
+    # 1. Calculate base window frames
     window_frames = int(window_sec * fps)
     if window_frames % 2 == 0:
         window_frames += 1
 
-    drift = percentile_filter(dff, percentile=percentile, size=window_frames, mode='reflect')
-    dff_corrected = dff - drift
+    # 2. Extract the raw non-linear baseline via percentile filter
+    raw_drift = percentile_filter(dff, percentile=percentile, size=window_frames, mode='reflect')
+    
+    # 3. Smooth the jagged baseline to prevent edge-artifacts under spikes
+    # A smoothing window of 1/4th the main window beautifully rounds the steps
+    smooth_frames = max(1, window_frames // 4)
+    smoothed_drift = uniform_filter1d(raw_drift, size=smooth_frames, mode='reflect')
 
-    return dff_corrected, drift
+    # 4. Apply additive correction
+    dff_corrected = dff - smoothed_drift
 
-
+    return dff_corrected, smoothed_drift
 
 
 def robust_quality_control(dff, spikes, fps, min_spikes=5, snr_threshold=2.5):
@@ -719,8 +729,11 @@ def robust_quality_control(dff, spikes, fps, min_spikes=5, snr_threshold=2.5):
     # Calculate MASD and normalize by sqrt(fps) to match Cascade standard
     noise_est = np.median(np.abs(successive_diffs)) / np.sqrt(fps)
 
-    # Signal variance vs Noise variance approximation
-    signal_est = np.std(dff)
+    # 99th Percentile Peak
+    baseline_median = np.median(dff)
+    robust_peak = np.percentile(dff, 99)
+    
+    signal_est = robust_peak - baseline_median
     
     # Epsilon prevents ZeroDivisionError if a trace is perfectly flat (artifact)
     snr = signal_est / (noise_est + np.finfo(float).eps)
