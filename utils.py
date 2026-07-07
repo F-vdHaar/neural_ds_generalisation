@@ -58,8 +58,7 @@ from scipy.stats import pearsonr
 from scipy.ndimage import percentile_filter
 from scipy.ndimage import gaussian_filter1d
 
-from typing import Dict, Tuple, List, Optional
-
+from typing import Dict, Tuple, List, Optional, Any
 
 def standardize_trace(dff, t, target_fs=30.0, aa_safety_factor=0.9):
     """
@@ -1044,6 +1043,48 @@ def scale_features(X_train, X_val):
 
 
 
+
+def filter_by_indicator(
+    data_dict: Dict[str, Any], 
+    condition: str, 
+    ind_map: Dict[str, str]
+) -> Optional[Dict[str, Any]]:
+    """
+    Filters a dictionary of neural recordings based on the calcium indicator type.
+    
+    This function creates the domain-specific training splits required to test 
+    asymmetric generalization across fast (GCaMP6f) and slow (GCaMP6s) indicators.
+    
+    Parameters
+    ----------
+    data_dict : dict
+        Dictionary containing the preprocessed recording objects.
+        Expected format: {recording_id: recording_data_dict, ...}
+    condition : str
+        The experimental training condition. 
+        Must be one of: '6f_only', '6s_only', or 'mixed'.
+    ind_map : dict
+        Mapping of dataset IDs to their corresponding indicator.
+        Example: {'DS09': '6f', 'DS14': '6s'}
+        
+    Returns
+    -------
+    dict or None
+        A filtered dictionary containing only recordings that match the requested 
+        indicator condition, or None if the resulting pool is empty.
+    """
+    if condition == 'mixed':
+        return data_dict  # The mixed model sees all available data
+    
+    target_ind = '6f' if condition == '6f_only' else '6s'
+    
+    # Extract only the recordings that belong to the target indicator
+    filtered = {
+        rid: r for rid, r in data_dict.items() 
+        if ind_map[r['dataset_id']] == target_ind
+    }
+    
+    return filtered if len(filtered) > 0 else None
 
     ####### EVALUATION _ TODO
 
