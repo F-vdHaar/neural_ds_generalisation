@@ -880,7 +880,7 @@ def partition_recordings(
     return train_set, val_set
 
 
-def augment_train_noise(train_recordings: Dict[str, dict], target_fs: float = 30.0) -> Dict[str, dict]:
+def augment_train_noise(train_recordings: dict, target_fs: float = 30.0, ceiling: float = None) -> dict:
     """
     Data Augmentation: Injects Gaussian noise into clean training recordings so that 
     the entire training set shares a uniform, worst-case noise distribution.
@@ -895,19 +895,27 @@ def augment_train_noise(train_recordings: Dict[str, dict], target_fs: float = 30
         noise (N(0, sigma_add)) to perfectly match the target noise floor.
     """
     import copy
-    
-    # 1. Calculate the exact noise level (MASD) of every training recording
+ # 1. Calculate the exact noise level of every training recording
     noise_levels = {}
     for rid, data in train_recordings.items():
-        # MASD formula (identical to your robust_quality_control)
-        diffs = np.diff(data['dff_clean'])
+        # Handle whatever trace key you are using
+        trace = data.get('dff_clean', data.get('dff_corrected', data.get('dff')))
+        
+        diffs = np.diff(trace)
         masd = np.median(np.abs(diffs))
-        # Convert MASD to an approximate standard deviation
+        
+        # Convert MASD to standard deviation
         sigma_approx = (masd / 0.6745)
         noise_levels[rid] = sigma_approx
 
-    # 2. Find the "worst" (highest) noise level to act as our target
-    target_noise = np.max(list(noise_levels.values()))
+    # 2. Set the target noise level (using the fair Fold Ceiling)
+    if ceiling is not None:
+        # Convert the global 'nu' ceiling back into standard deviation at the target frame rate
+        target_masd = ceiling * np.sqrt(target_fs)
+        target_noise = target_masd / 0.6745
+    else:
+        # Fallback to local max if no ceiling was passed
+        target_noise = np.max(list(noise_levels.values()))
     
     augmented_dataset = {}
     
@@ -925,17 +933,28 @@ def augment_train_noise(train_recordings: Dict[str, dict], target_fs: float = 30
         if missing_variance > 0:
             sigma_added = np.sqrt(missing_variance)
             
+            # Extract the correct trace
+            trace = data.get('dff_clean', data.get('dff_corrected', data.get('dff')))
+            
             # Generate the artificial noise
-            noise_vector = np.random.normal(scale=sigma_added, size=len(data['dff_clean']))
+            noise_vector = np.random.normal(scale=sigma_added, size=len(trace))
             
             # Create a noisy clone
             noisy_rid = f"{rid}_augmented"
             augmented_dataset[noisy_rid] = copy.deepcopy(data)
             
-            # Inject the noise into the dF/F trace
-            augmented_dataset[noisy_rid]['dff_clean'] += noise_vector
+            # Safely inject the noise into the correct key
+            if 'dff_clean' in augmented_dataset[noisy_rid]:
+                augmented_dataset[noisy_rid]['dff_clean'] += noise_vector
+            elif 'dff_corrected' in augmented_dataset[noisy_rid]:
+                augmented_dataset[noisy_rid]['dff_corrected'] += noise_vector
+            else:
+                augmented_dataset[noisy_rid]['dff'] += noise_vector
             
     return augmented_dataset
+
+
+    
 def generate_sliding_windows(
     isolated_dataset: Dict[str, dict],
     window_size: int = 64,
@@ -1085,6 +1104,30 @@ def filter_by_indicator(
     }
     
     return filtered if len(filtered) > 0 else None
+
+def compute_noise_ceiling(data_pool):
+    """
+    Calculates the 95th percentile of the baseline noise metric across a pool of recordings.
+    This creates a robust 'ceiling' for the noise augmentation step.
+    """
+    import numpy as np
+    
+    noise_levels = []
+    for rid, record in data_pool.items():
+        # Make sure this matches the key you used for your corrected dF/F trace
+        dff = record.get('dff_corrected', record.get('dff', []))
+        fr = record.get('frame_rate', 30.0)
+        
+        if len(dff) > 1:
+            # Cascade noise metric: Median absolute frame-to-frame difference / sqrt(Hz)
+            nu = np.median(np.abs(np.diff(dff))) / np.sqrt(fr)
+            noise_levels.append(nu)
+            
+    if not noise_levels:
+        return 0.001 # Fallback safe minimum
+        
+    # Return 95th percentile to avoid one crazy outlier pushing the ceiling too high
+    return np.percentile(noise_levels, 95)
 
     ####### EVALUATION _ TODO
 
