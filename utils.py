@@ -14,13 +14,62 @@ Pipeline order:
                                    -- correct hardware timing lag (fit ONE
                                       lag per source dataset, then apply it
                                       to each of that dataset's recordings)
+                                      [not used in this project -- see
+                                      notebook Step 2b for why]
     4. correct_dff_baseline_drift -- remove slow drift from ALREADY-COMPUTED
                                       dF/F (use compute_dynamic_dff instead
                                       only if you truly have raw fluorescence)
-    5. robust_quality_control     -- SNR / spike-count based exclusion
+    5. get_dynamic_snr_threshold +
+       robust_quality_control     -- simulate a null-noise SNR floor, then
+                                      SNR / spike-count based exclusion
     6. smooth_spike_train         -- Gaussian-smoothed target, in true Hz
-    7. partition_recordings       -- stratified recording-level train/val split
+    7. compute_noise_ceiling +
+       augment_train_noise        -- per-fold noise-ceiling matching; the
+                                      ceiling must be fit from ONE fold's
+                                      training pool only, never from data
+                                      that includes the held-out dataset
     8. generate_sliding_windows   -- windows, built only from QC-passed data
+    9. filter_by_indicator +
+       scale_features +
+       create_balanced_dataloader -- per-fold conditioning, scaling (fit
+                                      once per fold, reused across every
+                                      condition), and indicator-balanced
+                                      batching
+
+    partition_recordings is superseded by Leave-One-Dataset-Out CV for this
+    project (see notebook) but is kept for projects that don't need LODO.
+    evaluate_predictions scores model output once a model exists.
+
+CHANGELOG (patched review round 2 -- preprocessing finalization):
+    - augment_train_noise: fixed the MAD-to-sigma conversion. It divided by
+      0.6745, the constant that converts the MAD *of a single Gaussian
+      sample* into a standard deviation -- but this function's MASD is the
+      median absolute *difference between consecutive samples*, which has
+      sqrt(2) times the variance of a single sample, so the correct divisor
+      is 0.6745 * sqrt(2) (~0.9539). Left uncorrected, this made the
+      function systematically over-inject noise (verified by simulation:
+      ~41% too much injected sigma, ~2x too much injected variance), so it
+      would not actually bring a recording's noise up to the intended
+      ceiling, despite the docstring's claim to "perfectly match" it.
+    - compute_noise_ceiling: fixed the trace-key lookup, which checked for
+      'dff_corrected' before 'dff_clean' -- but this pipeline's QC'd data
+      (phase3_clean_data) only ever has 'dff_clean'. Every record was
+      silently falling through to the [] default, so every call quietly
+      returned the 0.001 fallback ceiling regardless of the real data. Now
+      checks 'dff_clean' first and raises if no known key is present,
+      instead of silently returning a fabricated ceiling.
+    - evaluate_predictions: the returned dict now actually includes 'mse'
+      and 'f1_score', as the docstring always said it would. Both were
+      being computed and then dropped before the return.
+    - robust_quality_control: snr_threshold no longer defaults to 2.5, the
+      exact value already shown (see get_dynamic_snr_threshold) to be
+      mathematically incapable of excluding pure noise. It's now a required
+      keyword argument; omitting it raises immediately instead of silently
+      admitting every recording.
+    - get_dynamic_snr_threshold: new function, moved here from the notebook
+      so the QC step and every sanity check that verifies it share one
+      implementation, instead of three copies that can silently drift apart
+      (which is exactly what had happened).
 
 CHANGELOG (patched review round):
     - robust_quality_control: fixed `return is_valid,` trailing-comma bug
@@ -66,7 +115,7 @@ from sklearn.metrics import f1_score
 
 import torch
 from torch.utils.data import TensorDataset, DataLoader, WeightedRandomSampler
-
+import torch.nn as nn
 
 def standardize_trace(dff, t, target_fs=30.0, aa_safety_factor=0.9):
     """
@@ -691,7 +740,63 @@ def correct_dff_baseline_drift(dff, fps=30.0, window_sec=15.0, percentile=8):
     return dff_corrected, smoothed_drift
 
 
-def robust_quality_control(dff, spikes, fps, min_spikes=5, snr_threshold=2.5):
+def get_dynamic_snr_threshold(fps, strictness_multiplier=3.0, seed=42):
+    """
+    Dynamically calculates the minimum SNR threshold for robust_quality_control
+    by simulating pure Gaussian white noise and applying a strictness margin.
+
+    PROBLEM
+        A fixed numeric SNR threshold (e.g. 2.5) is meaningless in isolation:
+        robust_quality_control's SNR formula is scale-invariant (both the
+        signal estimate and the noise estimate scale with the trace's own
+        variance), so pure noise scores essentially the same SNR regardless
+        of how noisy it actually is. Simulating pure Gaussian noise once
+        shows that floor sits around ~13.3 -- meaning a threshold of 2.5
+        can NEVER exclude anything, no matter how noisy a real recording is.
+
+    SOLUTION
+        Simulate a long stretch of pure white noise at the target frame
+        rate, compute the exact same SNR formula robust_quality_control
+        uses, and require real recordings to clear that empirical noise
+        floor by a strictness_multiplier margin. This was previously
+        defined inline in the notebook; it now lives here so the QC step
+        and every sanity check that verifies QC call the same function
+        instead of three copies that can silently drift out of sync.
+
+    Parameters
+    ----------
+    fps : float
+        Frame rate the threshold should be calibrated for.
+    strictness_multiplier : float
+        How many multiples of the pure-noise SNR floor a real recording
+        must clear. This is itself a judgment call, not a derived constant
+        -- 3.0 is a reasonable default but hasn't been validated with a
+        sensitivity sweep (e.g. checking whether QC-passing recordings
+        change materially at 2x or 4x).
+    seed : int
+        Seed for the simulated noise, for reproducibility.
+
+    Returns
+    -------
+    dynamic_threshold : float
+        SNR threshold to pass into robust_quality_control(..., snr_threshold=...).
+    """
+    rng = np.random.default_rng(seed)
+
+    # Simulate 5 minutes of pure white noise (no biological signal)
+    pure_noise = rng.normal(0, 1, int(fps * 300))
+
+    # Replicate the exact math from robust_quality_control
+    signal_est = np.percentile(pure_noise, 99) - np.median(pure_noise)
+    noise_est = np.median(np.abs(np.diff(pure_noise))) / np.sqrt(fps)
+
+    theoretical_noise_floor = signal_est / (noise_est + np.finfo(float).eps)
+
+    # Require the biological signal to be X times stronger than pure noise
+    return theoretical_noise_floor * strictness_multiplier
+
+
+def robust_quality_control(dff, spikes, fps, min_spikes=5, snr_threshold=None):
     """
     Evaluates if a trace meets the required quality thresholds for gradient descent.
     
@@ -706,7 +811,13 @@ def robust_quality_control(dff, spikes, fps, min_spikes=5, snr_threshold=2.5):
     min_spikes : int
         Minimum number of action potentials required in the recording.
     snr_threshold : float
-        Minimum Signal-to-Noise Ratio.
+        Minimum Signal-to-Noise Ratio. REQUIRED -- no default. This used to
+        default to 2.5, but pure Gaussian white noise scores ~13.3 on this
+        exact metric (see get_dynamic_snr_threshold's docstring for the
+        derivation), so 2.5 could never exclude anything and every call
+        that relied on the default was silently a no-op QC step. Compute a
+        real threshold with get_dynamic_snr_threshold(fps) and pass it
+        explicitly.
         
     Returns:
     --------
@@ -715,6 +826,14 @@ def robust_quality_control(dff, spikes, fps, min_spikes=5, snr_threshold=2.5):
     metrics : dict
         Dictionary containing calculated SNR and total spikes.
     """
+    if snr_threshold is None:
+        raise ValueError(
+            "snr_threshold is required and has no default. The old default "
+            "of 2.5 was mathematically incapable of excluding pure noise "
+            "(pure Gaussian noise scores ~13.3 on this metric) and could "
+            "silently pass every recording. Compute a real threshold with "
+            "get_dynamic_snr_threshold(fps) and pass it explicitly."
+        )
     total_spikes = np.sum(spikes)
 
     
@@ -901,8 +1020,25 @@ def augment_train_noise(train_recordings: dict, target_fs: float = 30.0, ceiling
         Find the maximum baseline noise (MASD) in the training set. For every 
         cleaner recording, calculate the missing variance and inject Gaussian 
         noise (N(0, sigma_add)) to perfectly match the target noise floor.
+
+    BUG FIX: this used to divide MASD by 0.6745 to recover a Gaussian sigma.
+    0.6745 is the correct constant for the MAD *of a single Gaussian sample*
+    around its own median. But `masd` here is the median absolute
+    *difference between two consecutive samples* -- for iid Gaussian noise,
+    Var(x[i+1] - x[i]) = 2*Var(x[i]), so the difference has sqrt(2) times
+    the standard deviation of a single sample, and the correct divisor is
+    0.6745 * sqrt(2) (~0.9539), not 0.6745 alone. Using 0.6745 overestimates
+    sigma by a factor of sqrt(2) for BOTH `current_noise` and `target_noise`
+    below; because `missing_variance` is a difference of squares, that bias
+    does not cancel -- it roughly doubles the injected variance, so this
+    function used to inject ~41% too much standard deviation (~2x too much
+    variance) relative to the ceiling it claims to match. Verified by
+    simulation: injecting into a sigma=1.0 trace to reach a sigma=1.5
+    target actually produced sigma~1.86 under the old constant.
     """
     import copy
+    MASD_TO_SIGMA = 0.6745 * np.sqrt(2)  # successive-difference MAD -> sigma
+
  # 1. Calculate the exact noise level of every training recording
     noise_levels = {}
     for rid, data in train_recordings.items():
@@ -913,14 +1049,14 @@ def augment_train_noise(train_recordings: dict, target_fs: float = 30.0, ceiling
         masd = np.median(np.abs(diffs))
         
         # Convert MASD to standard deviation
-        sigma_approx = (masd / 0.6745)
+        sigma_approx = (masd / MASD_TO_SIGMA)
         noise_levels[rid] = sigma_approx
 
     # 2. Set the target noise level (using the fair Fold Ceiling)
     if ceiling is not None:
         # Convert the global 'nu' ceiling back into standard deviation at the target frame rate
         target_masd = ceiling * np.sqrt(target_fs)
-        target_noise = target_masd / 0.6745
+        target_noise = target_masd / MASD_TO_SIGMA
     else:
         # Fallback to local max if no ceiling was passed
         target_noise = np.max(list(noise_levels.values()))
@@ -1118,27 +1254,53 @@ def filter_by_indicator(
     
     return filtered if len(filtered) > 0 else None
 
-def compute_noise_ceiling(data_pool):
+def compute_noise_ceiling(data_pool, target_fs: float = 30.0):
     """
     Calculates the 95th percentile of the baseline noise metric across a pool of recordings.
     This creates a robust 'ceiling' for the noise augmentation step.
+
+    BUG FIX: the trace-key lookup used to check 'dff_corrected' before
+    'dff_clean' -- but this pipeline's post-QC pool (phase3_clean_data)
+    only ever has 'dff_clean'. Every record silently fell through to the
+    [] default, so noise_levels always stayed empty and this function
+    always returned the 0.001 fallback regardless of the real data. Now
+    checks 'dff_clean' first, and raises immediately if a record has none
+    of the recognized keys, instead of silently skipping it. Also takes an
+    explicit target_fs (this pipeline doesn't store a per-record
+    'frame_rate' key once data reaches phase3_clean_data, so the old
+    hardcoded 30.0 fallback was invisible and would go stale silently if
+    TARGET_FS ever changed elsewhere).
     """
     import numpy as np
-    
+
     noise_levels = []
     for rid, record in data_pool.items():
-        # Make sure this matches the key you used for your corrected dF/F trace
-        dff = record.get('dff_corrected', record.get('dff', []))
-        fr = record.get('frame_rate', 30.0)
-        
+        dff = None
+        for key in ('dff_clean', 'dff_corrected', 'dff'):
+            if key in record:
+                dff = record[key]
+                break
+        if dff is None:
+            raise KeyError(
+                f"Record '{rid}' has none of the expected trace keys "
+                f"('dff_clean', 'dff_corrected', 'dff'); got {list(record.keys())}. "
+                f"compute_noise_ceiling would otherwise silently ignore this "
+                f"record and could return a meaningless ceiling."
+            )
+        fr = record.get('frame_rate', target_fs)
+
         if len(dff) > 1:
             # Cascade noise metric: Median absolute frame-to-frame difference / sqrt(Hz)
             nu = np.median(np.abs(np.diff(dff))) / np.sqrt(fr)
             noise_levels.append(nu)
-            
+
     if not noise_levels:
-        return 0.001 # Fallback safe minimum
-        
+        raise ValueError(
+            "compute_noise_ceiling found no usable recordings in data_pool "
+            "(pool was empty, or every trace had length <= 1). Refusing to "
+            "silently fall back to a fabricated ceiling -- check data_pool."
+        )
+
     # Return 95th percentile to avoid one crazy outlier pushing the ceiling too high
     return np.percentile(noise_levels, 95)
 
@@ -1190,8 +1352,14 @@ def evaluate_predictions(y_true: np.ndarray, y_pred: np.ndarray, threshold: floa
     # zero_division=0 prevents warnings if the network predicts absolutely nothing.
     f1 = f1_score(y_true_binary, y_pred_binary, zero_division=0)
     
+    # BUG FIX: mse and f1 were computed above but never made it into the
+    # returned dict, even though the docstring promises all three keys.
+    # Every call site that read metrics['mse'] or metrics['f1_score'] would
+    # have raised KeyError the moment it was reached.
     return {
         "pearson_r": r_val,
+        "mse": mse,
+        "f1_score": f1,
     }
 
 
@@ -1237,4 +1405,32 @@ def create_balanced_dataloader(X_train, y_train, indicator_labels, batch_size=25
                             torch.tensor(y_train, dtype=torch.float32))
     
     return DataLoader(dataset, batch_size=batch_size, sampler=sampler)
-     
+
+
+
+class Cascade1DCNN(nn.Module):
+    def __init__(self, window_size=64):
+        super(Cascade1DCNN, self).__init__()
+        # 1D Convolutional layers act as feature extractors [cite: 34]
+        self.conv_layers = nn.Sequential(
+            nn.Conv1d(in_channels=1, out_channels=16, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.MaxPool1d(kernel_size=2),
+            nn.Conv1d(in_channels=16, out_channels=32, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.MaxPool1d(kernel_size=2),
+        )
+        self.fc_layers = nn.Sequential(
+            # Flattening the output of the convolutions
+            nn.Flatten(),
+            nn.Linear(32 * (window_size // 4), 64),
+            nn.ReLU(),
+            nn.Linear(64, window_size) # Mapping back to window size
+        )
+
+    def forward(self, x):
+        # x input shape: (batch_size, sequence_length)
+        x = x.unsqueeze(1) # Reshape to (batch, 1, seq_len) for Conv1d
+        x = self.conv_layers(x)
+        x = self.fc_layers(x)
+        return x
