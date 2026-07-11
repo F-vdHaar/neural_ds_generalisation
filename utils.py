@@ -60,6 +60,14 @@ from scipy.ndimage import gaussian_filter1d
 
 from typing import Dict, Tuple, List, Optional, Any
 
+from scipy.stats import pearsonr
+from sklearn.metrics import f1_score
+
+
+import torch
+from torch.utils.data import TensorDataset, DataLoader, WeightedRandomSampler
+
+
 def standardize_trace(dff, t, target_fs=30.0, aa_safety_factor=0.9):
     """
     Resample a continuous dF/F trace onto a uniform time grid at `target_fs`.
@@ -1060,7 +1068,12 @@ def scale_features(X_train, X_val):
 
     return X_train_scaled, X_val_scaled
 
-
+def get_indicator(ds_name):
+    if 'GCaMP6f' in ds_name:
+        return '6f'
+    if 'GCaMP6s' in ds_name:
+        return '6s'
+    return 'UNKNOWN'
 
 
 def filter_by_indicator(
@@ -1158,8 +1171,7 @@ def evaluate_predictions(y_true: np.ndarray, y_pred: np.ndarray, threshold: floa
     metrics : dict
         Contains 'pearson_r', 'f1_score', and 'mse'.
     """
-    from scipy.stats import pearsonr
-    from sklearn.metrics import f1_score
+
     
     # 1. Pearson Correlation (Kinetic Shape & Timing)
     # Returns (statistic, p-value), we only need the statistic
@@ -1181,4 +1193,48 @@ def evaluate_predictions(y_true: np.ndarray, y_pred: np.ndarray, threshold: floa
     return {
         "pearson_r": r_val,
     }
+
+
+def create_balanced_dataloader(X_train, y_train, indicator_labels, batch_size=256):
+    """
+    Creates a PyTorch DataLoader that strictly balances GCaMP6f and GCaMP6s frames.
+    
+    Parameters
+    ----------
+    X_train : np.ndarray
+        Training features (sliding windows).
+    y_train : np.ndarray
+        Training targets (smoothed spikes).
+    indicator_labels : np.ndarray
+        1D array of strings ('6f' or '6s') corresponding to each window in X_train.
+    """
+    # 1. Convert labels to binary indices for bincount (0 for 6f, 1 for 6s)
+    label_map = {'6f': 0, '6s': 1}
+    binary_labels = np.array([label_map[ind] for ind in indicator_labels])
+    
+    # 2. Count occurrences of each indicator
+    class_counts = np.bincount(binary_labels)
+    
+    # Sanity Check: If we are doing single-indicator training, skip balancing
+    if len(class_counts) == 1 or class_counts.min() == 0:
+        dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float32), 
+                                torch.tensor(y_train, dtype=torch.float32))
+        return DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    # 3. Calculate weights (inverse frequency)
+    class_weights = 1.0 / class_counts
+    sample_weights = class_weights[binary_labels]
+    
+    # 4. Create the Sampler
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True
+    )
+    
+    # 5. Build and return DataLoader
+    dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float32), 
+                            torch.tensor(y_train, dtype=torch.float32))
+    
+    return DataLoader(dataset, batch_size=batch_size, sampler=sampler)
      
