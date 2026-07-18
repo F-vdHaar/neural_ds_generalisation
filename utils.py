@@ -40,6 +40,21 @@ Pipeline order:
     project (see notebook) but is kept for projects that don't need LODO.
     evaluate_predictions scores model output once a model exists.
 
+CHANGELOG (patched review round 3 -- first training pass):
+    - Cascade1DCNN: fixed the output layer, which produced a full
+      (batch, window_size) prediction. generate_sliding_windows' Y is
+      (batch,) -- one center-frame target per window -- so this would have
+      raised a RuntimeError on the first real training step (verified with
+      a numpy repro of the same broadcasting rule torch uses: (256,64) and
+      (256,) don't broadcast at all). Also added Softplus on the output
+      (rate can't be negative) and light dropout (windows overlap heavily
+      at stride=2 vs. window_size=64, so raw window count overstates the
+      number of independent examples).
+    - train_model: new function. Tracks Pearson r on the validation set
+      every epoch alongside loss, specifically so a predict-near-zero
+      collapse (an easy local minimum given how sparse these targets are)
+      is visible even when the loss curve alone looks fine.
+
 CHANGELOG (patched review round 2 -- preprocessing finalization):
     - augment_train_noise: fixed the MAD-to-sigma conversion. It divided by
       0.6745, the constant that converts the MAD *of a single Gaussian
@@ -1409,7 +1424,30 @@ def create_balanced_dataloader(X_train, y_train, indicator_labels, batch_size=25
 
 
 class Cascade1DCNN(nn.Module):
-    def __init__(self, window_size=64):
+    """
+    A small 1D CNN for center-frame spike-rate regression from a window of
+    calcium-imaging context frames.
+
+    BUG FIX: the final layer used to be `nn.Linear(64, window_size)`,
+    producing a full (batch, window_size) output. But generate_sliding_windows
+    returns Y with shape (N,) -- a single center-aligned target per window,
+    not a per-frame sequence (see its docstring) -- so training against the
+    real data would have raised a RuntimeError the first time it was tried:
+    (batch, 64) predictions against (batch,) targets don't broadcast the way
+    you'd want; verified with a numpy repro of the same broadcasting rule
+    torch uses (shapes (256,64) and (256,) can't combine at all -- there's no
+    silent-wrong-answer version of this, it just errors). Output layer now
+    maps to a single value per window, matching the actual task.
+
+    Also added:
+    - Softplus on the output. Spike rate can't be negative, and it's smoother
+      than ReLU right at zero -- which is where most of this dataset's
+      targets sit, given how sparse spiking is relative to a 64-frame window.
+    - Light dropout in the FC layers. Windows overlap heavily at stride=2
+      vs. window_size=64 (adjacent windows share 62 of 64 frames), so raw
+      window count overstates how many independent examples you actually have.
+    """
+    def __init__(self, window_size=64, dropout=0.2):
         super(Cascade1DCNN, self).__init__()
         # 1D Convolutional layers act as feature extractors [cite: 34]
         self.conv_layers = nn.Sequential(
@@ -1425,7 +1463,9 @@ class Cascade1DCNN(nn.Module):
             nn.Flatten(),
             nn.Linear(32 * (window_size // 4), 64),
             nn.ReLU(),
-            nn.Linear(64, window_size) # Mapping back to window size
+            nn.Dropout(dropout),
+            nn.Linear(64, 1),   # BUG FIX: was `window_size`; target is a single value
+            nn.Softplus(),      # spike rate >= 0
         )
 
     def forward(self, x):
@@ -1433,4 +1473,93 @@ class Cascade1DCNN(nn.Module):
         x = x.unsqueeze(1) # Reshape to (batch, 1, seq_len) for Conv1d
         x = self.conv_layers(x)
         x = self.fc_layers(x)
-        return x
+        return x.squeeze(-1)   # (batch, 1) -> (batch,), matching Y's shape
+
+
+def train_model(model, train_loader, val_loader, epochs=5, lr=1e-3, device=None, verbose=True):
+    """
+    Trains `model` with MSE loss and Adam, tracking both loss and Pearson r
+    on the validation set every epoch.
+
+    WHY TRACK PEARSON R, NOT JUST LOSS: with targets this sparse (most
+    64-frame windows have a smoothed-rate target near zero -- spiking is
+    sparse relative to a ~2-second window), a model that collapses to
+    predicting ~zero everywhere can still show a deceptively low MSE, since
+    most targets really are near zero. Pearson r against the validation set
+    makes that failure mode visible immediately (r near 0, or undefined if
+    predictions have ~zero variance) even when the loss curve looks fine on
+    its own. If you see loss decreasing but val_pearson_r staying near 0,
+    that's the collapse, not progress.
+
+    Parameters
+    ----------
+    model : nn.Module
+        Any model that maps (batch, window_size) -> (batch,), e.g. Cascade1DCNN.
+    train_loader, val_loader : DataLoader
+        Yield (X_batch, y_batch) pairs; y_batch shape (batch,).
+    epochs : int
+        Deliberately small by default -- this function is also meant for
+        quick sanity checks, not just full runs. Increase once you've
+        confirmed the loop actually works and the loss/r trend the right way.
+    lr : float
+        Adam learning rate.
+    device : str or None
+        'cuda'/'cpu'/'mps'; autodetects if None.
+
+    Returns
+    -------
+    history : dict
+        {'train_loss': [...], 'val_loss': [...], 'val_pearson_r': [...]},
+        one entry per epoch.
+    """
+    device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+
+    history = {'train_loss': [], 'val_loss': [], 'val_pearson_r': []}
+
+    for epoch in range(epochs):
+        model.train()
+        running_loss, n_batches = 0.0, 0
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+            y_pred = model(X_batch)
+            loss = criterion(y_pred, y_batch)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+            n_batches += 1
+        train_loss = running_loss / max(n_batches, 1)
+
+        model.eval()
+        val_losses, all_preds, all_true = [], [], []
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                y_pred = model(X_batch)
+                val_losses.append(criterion(y_pred, y_batch).item())
+                all_preds.append(y_pred.cpu().numpy())
+                all_true.append(y_batch.cpu().numpy())
+        val_loss = float(np.mean(val_losses)) if val_losses else float('nan')
+        all_preds = np.concatenate(all_preds) if all_preds else np.array([])
+        all_true = np.concatenate(all_true) if all_true else np.array([])
+        # guard against the degenerate "predicts a constant" case, where
+        # pearsonr is undefined (zero variance) rather than just low
+        if len(all_true) > 1 and np.std(all_preds) > 1e-8:
+            val_r = float(pearsonr(all_true, all_preds)[0])
+        else:
+            val_r = float('nan')
+
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['val_pearson_r'].append(val_r)
+
+        if verbose:
+            flag = "  <-- near-zero r despite the loss: check for a predict-zero collapse" \
+                if (not np.isnan(val_r) and abs(val_r) < 0.05 and epoch >= 1) else ""
+            print(f"Epoch {epoch+1}/{epochs}  train_loss={train_loss:.5f}  "
+                  f"val_loss={val_loss:.5f}  val_pearson_r={val_r:.4f}{flag}")
+
+    return history
